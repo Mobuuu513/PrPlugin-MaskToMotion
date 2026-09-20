@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>KEYPATH</title>
+    <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+    <p class="kicker">Mask to transform</p>
+    <h1>KEYPATH</h1>
+</header>
+
+<section>
+    <p class="label">1. Load tracking</p>
+    <div id="btn-clip" class="btn">Read selected clip</div>
+    <div id="btn-clipboard" class="btn">Get from clipboard</div>
+    <textarea id="paste" placeholder="Or paste JSON [{t,x,y,scale,rotation}]"></textarea>
+    <p id="load-status" class="muted">Select the tracked clip, then Read selected clip. Reads at most 80 keys so Premiere stays alive.</p>
+</section>
+
+<section>
+    <p class="label">2. Mode</p>
+    <div class="row">
+        <div id="mode-follow" class="btn on">Follow</div>
+        <div id="mode-stabilize" class="btn">Stabilize</div>
+    </div>
+</section>
+
+<section>
+    <p class="label">3. Properties</p>
+    <label class="check"><input id="prop-position" type="checkbox" checked /> Position</label>
+    <label class="check"><input id="prop-scale" type="checkbox" checked /> Scale</label>
+    <label class="check"><input id="prop-rotation" type="checkbox" checked /> Rotation</label>
+    <div class="row">
+        <div id="ch-xy" class="btn on">X + Y</div>
+        <div id="ch-x" class="btn">X only</div>
+        <div id="ch-y" class="btn">Y only</div>
+    </div>
+    <label class="check">
+        <input id="use-transform" type="checkbox" checked />
+        Write Transform (not Motion)
+    </label>
+</section>
+
+<section>
+    <p class="label">Sample every <span id="nth-val">4</span></p>
+    <input id="nth" type="range" min="1" max="12" value="4" />
+    <p id="plan-status" class="muted">0 keys</p>
+</section>
+
+<div id="btn-apply" class="btn primary">Apply keyframes</div>
+<p id="result" class="muted"></p>
+
+<script src="index.js"></script>
+</body>
+</html>

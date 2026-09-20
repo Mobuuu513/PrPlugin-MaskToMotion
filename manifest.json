@@ -1,0 +1,52 @@
+{
+  "id": "com.xai.keypath",
+  "name": "KEYPATH",
+  "version": "1.0.2",
+  "main": "index.html",
+  "manifestVersion": 5,
+  "host": {
+    "app": "premierepro",
+    "minVersion": "25.6.0"
+  },
+  "requiredPermissions": {
+    "clipboard": "readAndWrite",
+    "localFileSystem": "request"
+  },
+  "entrypoints": [
+    {
+      "id": "keypath.panel",
+      "type": "panel",
+      "minimumSize": { "width": 280, "height": 480 },
+      "maximumSize": { "width": 2000, "height": 2000 },
+      "preferredDockedSize": { "width": 320, "height": 720 },
+      "preferredFloatingSize": { "width": 360, "height": 740 },
+      "label": { "default": "KEYPATH" },
+      "icons": [
+        {
+          "width": 23,
+          "height": 23,
+          "path": "icons/dark.svg",
+          "scale": [1, 2],
+          "theme": ["darkest", "dark", "medium"]
+        },
+        {
+          "width": 23,
+          "height": 23,
+          "path": "icons/light.svg",
+          "scale": [1, 2],
+          "theme": ["lightest", "light"]
+        }
+      ]
+    }
+  ],
+  "icons": [
+    {
+      "width": 48,
+      "height": 48,
+      "path": "icons/plugin-icon.svg",
+      "scale": [1, 2],
+      "theme": ["darkest", "dark", "medium", "lightest", "light", "all"],
+      "species": ["pluginList"]
+    }
+  ]
+}

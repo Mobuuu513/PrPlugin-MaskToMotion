@@ -1,4 +1,4 @@
-/* KEYPATH 1.0.11 — Fresh script objects per transaction (fixes 'script object is no longer valid'), verified writes, unit-aware */
+/* KEYPATH 1.0.15 — Mask scan matches 'Path' as well as 'Mask …', lists every parameter it saw, clearer Unassigned-Mask guidance */
 (function () {
     var TICKS = 254016000000;
     var MATCH_TRANSFORM = "AE.ADBE Geometry2";
@@ -38,16 +38,28 @@
         }
     }
 
+    function bytesToText(u8) {
+        if (!u8 || !u8.length) return "";
+        var utf16 = (u8.length > 1 && u8[0] === 0xff && u8[1] === 0xfe) || (u8.length > 3 && u8[1] === 0 && u8[3] === 0);
+        try {
+            if (typeof TextDecoder !== "undefined") {
+                return new TextDecoder(utf16 ? "utf-16le" : "utf-8").decode(u8).replace(/\u0000/g, "");
+            }
+        } catch (e) {}
+        var out = "";
+        for (var i = 0; i < u8.length; i += 8192) {
+            out += String.fromCharCode.apply(null, u8.subarray(i, i + 8192));
+        }
+        return out.replace(/\u0000/g, "");
+    }
+
     function asText(value) {
         if (value == null) return "";
         if (typeof value === "string") return value;
         if (typeof value === "number" || typeof value === "boolean") return String(value);
-        if (typeof ArrayBuffer !== "undefined" && value instanceof ArrayBuffer) {
-            try {
-                return String.fromCharCode.apply(null, new Uint8Array(value));
-            } catch (e) {
-                return "";
-            }
+        if (typeof ArrayBuffer !== "undefined") {
+            if (value instanceof ArrayBuffer) return bytesToText(new Uint8Array(value));
+            if (ArrayBuffer.isView(value)) return bytesToText(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
         }
         if (typeof value === "object") {
             if (typeof value.text === "string") return value.text;
@@ -239,6 +251,19 @@
         });
     }
 
+    // Turn decoded mask shapes into follow-samples (sorted, times relative to the first shape)
+    function samplesFromShapes(keys, label) {
+        var sorted = keys.slice().sort(function (a, b) { return a.ticks - b.ticks; });
+        var t0 = sorted[0].ticks;
+        var rel = sorted.map(function (k) { return { ticks: k.ticks - t0, shape: k.shape }; });
+        return {
+            samples: solveFollow(rel, 1920, 1080),
+            detail: label + " · " + rel.length + " shapes",
+            unit: "px",
+            size: { w: 1920, h: 1080 },
+        };
+    }
+
     function parseCin2List(text) {
         var chunks = text.split(";").map(function (s) { return String(s).trim(); }).filter(Boolean);
         var keys = [];
@@ -254,6 +279,30 @@
                     shape: decodeCin2(b64ToBytes(b64)),
                 });
             } catch (e) {}
+        }
+        return keys;
+    }
+
+    // Fallback: find 2cin blobs anywhere in the text, with or without leading times
+    function scanCin2(text) {
+        var flat = String(text).replace(/\s+/g, "");
+        var keys = [];
+        var m;
+        var re = /(-?\d+),(MmNpbg[A-Za-z0-9+\/]*={0,2})/g;
+        while ((m = re.exec(flat))) {
+            try {
+                keys.push({ ticks: Number(m[1]), shape: decodeCin2(b64ToBytes(m[2])) });
+            } catch (e) {}
+        }
+        if (!keys.length) {
+            var re2 = /MmNpbg[A-Za-z0-9+\/]*={0,2}/g;
+            var i = 0;
+            while ((m = re2.exec(flat))) {
+                try {
+                    keys.push({ ticks: i * Math.round(TICKS / 24), shape: decodeCin2(b64ToBytes(m[0])) });
+                    i++;
+                } catch (e2) {}
+            }
         }
         return keys;
     }
@@ -294,23 +343,15 @@
     }
 
     function ingest(input) {
-        var raw = asText(input).replace(/^\uFEFF/, "").trim();
+        var raw = asText(input).replace(/\u0000/g, "").replace(/^\uFEFF/, "").trim();
         if (!raw) throw new Error("Nothing to load.");
         var xmlKeys = extractKeyframesXml(raw);
         if (xmlKeys) raw = xmlKeys;
         if (/^-?\d+\s*,/.test(raw) || raw.indexOf("MmNpbg") >= 0) {
             var keys = parseCin2List(raw);
+            if (!keys.length) keys = scanCin2(raw);
             if (!keys.length) throw new Error("No 2cin keys found.");
-            // Sort and make times relative to the first key so they land inside the target clip
-            keys.sort(function (a, b) { return a.ticks - b.ticks; });
-            var t0 = keys[0].ticks;
-            for (var k = 0; k < keys.length; k++) keys[k].ticks = keys[k].ticks - t0;
-            return {
-                samples: solveFollow(keys, 1920, 1080),
-                detail: "Mask path · " + keys.length + " shapes",
-                unit: "px",
-                size: { w: 1920, h: 1080 },
-            };
+            return samplesFromShapes(keys, "Mask path");
         }
         if (raw.charAt(0) === "[" || raw.charAt(0) === "{") {
             try {
@@ -343,14 +384,53 @@
         return true;
     }
 
+    function motionSummary(samples, unit) {
+        var minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+        var minS = Infinity, maxS = -Infinity, minR = Infinity, maxR = -Infinity;
+        for (var i = 0; i < samples.length; i++) {
+            var q = samples[i];
+            if (q.x < minX) minX = q.x;
+            if (q.x > maxX) maxX = q.x;
+            if (q.y < minY) minY = q.y;
+            if (q.y > maxY) maxY = q.y;
+            if (q.scale < minS) minS = q.scale;
+            if (q.scale > maxS) maxS = q.scale;
+            if (q.rotation < minR) minR = q.rotation;
+            if (q.rotation > maxR) maxR = q.rotation;
+        }
+        var thr = unit === "norm" ? 5e-5 : 0.05;
+        var dx = samples.length ? maxX - minX : 0;
+        var dy = samples.length ? maxY - minY : 0;
+        return {
+            dx: dx,
+            dy: dy,
+            moveX: dx > thr,
+            moveY: dy > thr,
+            moveScale: samples.length ? maxS - minS > 0.01 : false,
+            moveRot: samples.length ? maxR - minR > 0.01 : false,
+        };
+    }
+
     function loadSamples(samples, detail, unit, size) {
         state.samples = samples;
         state.srcUnit = unit || (looksNormalized(samples) ? "norm" : "px");
         state.srcSize = size || null;
-        var label = detail + (state.srcUnit === "norm" ? " · normalized" : " · px");
+        var mo = motionSummary(samples, state.srcUnit);
+        var digits = state.srcUnit === "norm" ? 4 : 1;
+        var label =
+            detail +
+            (state.srcUnit === "norm" ? " · normalized" : " · px") +
+            " · Δx " + mo.dx.toFixed(digits) + " Δy " + mo.dy.toFixed(digits);
         $("load-status").textContent = label;
         refreshPlan();
-        setResult(label, "ok");
+        if (!mo.moveX && !mo.moveY && !mo.moveScale && !mo.moveRot) {
+            setResult(
+                label + " — the loaded data has NO motion. For mask tracking, select the Mask Path property in Effect Controls, copy it (Ctrl/Cmd+C) and use Read clipboard.",
+                "bad"
+            );
+        } else {
+            setResult(label, "ok");
+        }
     }
 
     function tickSeconds(t) {
@@ -512,6 +592,132 @@
         return isFinite(n) ? n : 0;
     }
 
+    function describeValue(v) {
+        if (v == null) return String(v);
+        var t = typeof v;
+        if (t === "string") return "string(" + v.length + ") \"" + v.slice(0, 10) + "\"";
+        if (t !== "object") return t;
+        var ctor = v.constructor && v.constructor.name ? v.constructor.name : "object";
+        if (v.byteLength != null) return ctor + "(" + v.byteLength + " bytes)";
+        var keys = [];
+        try { keys = Object.keys(v).slice(0, 6); } catch (e) {}
+        return ctor + "{" + keys.join(",") + "}";
+    }
+
+    function numOr(v, d) {
+        var n = Number(v);
+        return isFinite(n) ? n : d;
+    }
+
+    // Try every representation a mask-path value could come back in and return a decoded shape (or null)
+    function valueToShape(v, depth) {
+        depth = depth || 0;
+        if (v == null || depth > 3) return null;
+        try {
+            if (typeof v === "string") {
+                var str = v.trim();
+                var comma = str.indexOf(",");
+                if (comma > 0 && comma < 24 && /^-?\d+$/.test(str.slice(0, comma).trim())) {
+                    str = str.slice(comma + 1).trim();
+                }
+                if (/^[A-Za-z0-9+/=\s]{40,}$/.test(str)) {
+                    return decodeCin2(b64ToBytes(str.replace(/\s+/g, "")));
+                }
+                return null;
+            }
+            if (typeof ArrayBuffer !== "undefined") {
+                if (v instanceof ArrayBuffer) return decodeCin2(new Uint8Array(v));
+                if (ArrayBuffer.isView(v)) return decodeCin2(new Uint8Array(v.buffer, v.byteOffset, v.byteLength));
+            }
+            if (Array.isArray(v.vertices) && v.vertices.length) {
+                return {
+                    vertices: v.vertices.map(function (q) {
+                        var x = numOr(q.x, 0);
+                        var y = numOr(q.y, 0);
+                        return {
+                            x: x,
+                            y: y,
+                            inX: numOr(q.inX, x),
+                            inY: numOr(q.inY, y),
+                            outX: numOr(q.outX, x),
+                            outY: numOr(q.outY, y),
+                        };
+                    }),
+                };
+            }
+            if (v.value != null) return valueToShape(v.value, depth + 1);
+        } catch (e) {
+            return null;
+        }
+        return null;
+    }
+
+    // Reads mask-path keyframes directly from the selected clip's effects (no clipboard).
+    async function readMaskFromClip(host, diag) {
+        var chain = await host.clip.getComponentChain();
+        var count = await chain.getComponentCount();
+        var cands = [];
+        var ci, pi;
+
+        setResult("Scanning effects for a mask path…", "muted");
+        for (ci = 0; ci < count; ci++) {
+            var comp = await chain.getComponentAtIndex(ci);
+            var dname = await comp.getDisplayName();
+            var match = await comp.getMatchName();
+            if (/audio|volume|time remap/i.test(dname + " " + match)) continue;
+            var n = await comp.getParamCount();
+            var seenNames = [];
+            for (pi = 0; pi < n; pi++) {
+                var prm = await comp.getParam(pi);
+                var pname = prm.displayName || "";
+                if (seenNames.length < 14) seenNames.push(pname || "(unnamed)");
+                // New mask UI labels the property just "Path"; older builds use "Mask Path"
+                if (!/mask|path/i.test(pname)) continue;
+                var tl = await keyTimes(prm);
+                diag.lines.push(dname + " › " + pname + ": " + tl.length + " keys");
+                if (tl.length >= 2) cands.push({ dname: dname, pname: pname, prm: prm, times: tl });
+            }
+            diag.names.push(dname + " [" + seenNames.join(", ") + (n > seenNames.length ? ", …" : "") + "]");
+            if (ci % 3 === 2) await yieldTick();
+        }
+
+        if (!cands.length) {
+            diag.note = "no keyframed Mask Path parameter is exposed on this clip";
+            return null;
+        }
+        cands.sort(function (a, b) { return b.times.length - a.times.length; });
+
+        for (var c = 0; c < cands.length; c++) {
+            var cand = cands[c];
+            var times = thinList(cand.times, MAX_SAMPLES);
+            var keys = [];
+            var seen = "";
+            for (var k = 0; k < times.length; k++) {
+                if (k && k % 8 === 0) {
+                    setResult("Reading mask " + k + "/" + times.length + "…", "muted");
+                    await yieldTick();
+                }
+                var tt = times[k];
+                var kf = await maybe(function () { return cand.prm.getKeyframePtr(tt); });
+                var raw = kf ? (kf.value != null ? kf.value : kf) : null;
+                var shape = valueToShape(raw);
+                if (!shape) {
+                    var gv = await maybe(function () { return cand.prm.getValueAtTime(tt); });
+                    if (!seen) seen = describeValue(raw) + " / " + describeValue(gv);
+                    shape = valueToShape(gv);
+                }
+                if (shape && shape.vertices && shape.vertices.length) {
+                    keys.push({ ticks: ticksOf(tt), shape: shape });
+                }
+            }
+            if (keys.length >= 2) {
+                return samplesFromShapes(keys, cand.dname + " › " + cand.pname);
+            }
+            diag.note = cand.pname + " has " + cand.times.length + " keys but its values are not readable by the API (" + (seen || "empty") + ")";
+        }
+        return null;
+    }
+
     async function readClipTracking(ppro) {
         var host = await getSelectedClip(ppro);
         var chain = await host.clip.getComponentChain();
@@ -546,21 +752,24 @@
             }
         }
 
-        if (!best || !best.pos) {
-            throw new Error("No mask/Transform Position on this clip. Select the tracked video clip first.");
+        var posKeys = best && best.pos ? best.times.length : 0;
+        if (posKeys < 2) {
+            // No animated Position: mask tracking lives in the mask path — read it directly from the clip
+            var diag = { lines: [], names: [], note: "" };
+            var masked = await readMaskFromClip(host, diag);
+            if (masked) return masked;
+            console.log("KEYPATH mask scan", diag);
+            throw new Error(
+                (best && best.pos
+                    ? "Position on " + best.dname + " has no keyframes, so there is no motion to read. "
+                    : "No animated Position on this clip. ") +
+                "Premiere only exposes masks that are assigned to an effect (e.g. draw the mask under Opacity, then track it). " +
+                "Masks under “Unassigned Masks” can only come through the clipboard: click the “Path” name in Effect Controls, press Ctrl/Cmd+C, then use Read clipboard." +
+                " [scan: " + (diag.note || "no keyframed mask parameter") + " | " + diag.names.join(" | ").slice(0, 420) + "]"
+            );
         }
 
         var times = thinList(best.times, MAX_SAMPLES);
-        if (!times.length) {
-            var startPt = tickSeconds(await host.clip.getInPoint());
-            var dur = tickSeconds(await host.clip.getDuration());
-            if (dur <= 0) dur = 4;
-            var n = 24;
-            times = [];
-            for (var f = 0; f <= n; f++) {
-                times.push(ppro.TickTime.createWithSeconds(startPt + (f * dur) / n));
-            }
-        }
 
         setResult("Reading " + times.length + " keys from " + best.dname + "…", "muted");
         var samples = [];
@@ -831,6 +1040,20 @@
         }
         if (!jobs.length) throw new Error("None of the selected properties exist on " + compName + ".");
 
+        var mo = motionSummary(samples, state.srcUnit);
+        var moves = false;
+        for (var m = 0; m < jobs.length; m++) {
+            if (jobs[m].key === "pos" && ((mo.moveX && state.channel !== "y") || (mo.moveY && state.channel !== "x"))) moves = true;
+            if (jobs[m].key === "sc" && mo.moveScale) moves = true;
+            if (jobs[m].key === "rot" && mo.moveRot) moves = true;
+        }
+        if (!moves) {
+            throw new Error(
+                "The loaded tracking has no motion for the selected properties/channel, so every key would be identical. " +
+                "Reload the tracking (for mask tracking: copy the Mask Path keyframes and use Read clipboard)."
+            );
+        }
+
         // STEP 1: enable stopwatch (own transaction, fresh params)
         ctx.stage = "enable stopwatch";
         var keyList = jobs.map(function (j) { return j.key; });
@@ -856,9 +1079,25 @@
         var total = 0;
         for (var v = 0; v < jobs.length; v++) {
             var vp = await resolveParam(host.clip, cref, jobs[v].key);
-            var n = vp ? (await keyTimes(vp)).length : 0;
+            var tl = vp ? await keyTimes(vp) : [];
+            var n = tl.length;
             total += n;
-            report.push(jobs[v].label + " " + n);
+            var extra = "";
+            if (n >= 2) {
+                var first = await maybe(function () { return vp.getValueAtTime(tl[0]); });
+                var last = await maybe(function () { return vp.getValueAtTime(tl[n - 1]); });
+                if (jobs[v].key === "pos") {
+                    var a = unpackPoint(first);
+                    var b = unpackPoint(last);
+                    var dg = tgtNorm ? 3 : 1;
+                    if (a && b) {
+                        extra = " (" + a.x.toFixed(dg) + "," + a.y.toFixed(dg) + " → " + b.x.toFixed(dg) + "," + b.y.toFixed(dg) + ")";
+                    }
+                } else {
+                    extra = " (" + unpackNum(first).toFixed(1) + " → " + unpackNum(last).toFixed(1) + ")";
+                }
+            }
+            report.push(jobs[v].label + " " + n + extra);
         }
 
         if (!total) {
@@ -890,24 +1129,62 @@
         }
     }
 
+    function describeClipboard(data) {
+        if (data == null) return "nothing";
+        if (typeof data === "string") return "text(" + data.length + ")";
+        if (typeof data !== "object") return typeof data;
+        var parts = [];
+        for (var k in data) {
+            if (Object.prototype.hasOwnProperty.call(data, k)) parts.push(k + ": " + describeValue(data[k]));
+        }
+        return parts.length ? parts.join(", ") : "empty object";
+    }
+
+    async function readClipboardText() {
+        var cb = navigator.clipboard;
+        if (!cb) throw new Error("Clipboard API not available.");
+        var attempts = [];
+        if (typeof cb.getContent === "function") attempts.push({ name: "getContent", fn: function () { return cb.getContent(); } });
+        if (typeof cb.readText === "function") attempts.push({ name: "readText", fn: function () { return cb.readText(); } });
+        var notes = [];
+        for (var i = 0; i < attempts.length; i++) {
+            try {
+                var data = await attempts[i].fn();
+                var text = clipboardText(data);
+                if (text && text.trim() && text !== "{}" && text !== "null") return text;
+                notes.push(attempts[i].name + " → " + describeClipboard(data));
+            } catch (e) {
+                notes.push(attempts[i].name + " failed: " + (e && e.message ? e.message : e));
+            }
+        }
+        console.log("KEYPATH clipboard", notes);
+        throw new Error(
+            "Clipboard gave no readable text (" + (notes.join(" | ") || "no clipboard API") + "). " +
+            "Click the paste box and press Ctrl/Cmd+V instead."
+        );
+    }
+
     $("btn-clipboard").addEventListener("click", function () {
         setResult("Reading clipboard…", "muted");
-        var p = navigator.clipboard.getContent
-            ? navigator.clipboard.getContent()
-            : navigator.clipboard.readText
-                ? navigator.clipboard.readText()
-                : Promise.reject(new Error("No clipboard API"));
-        p.then(function (data) {
-            var text = clipboardText(data);
-            if (!text) throw new Error("Clipboard empty or not text. Use Read selected clip.");
-            try {
-                $("paste").value = text.slice(0, 4000);
-            } catch (e) {}
-            var got = ingest(text);
-            loadSamples(got.samples, got.detail, got.unit, got.size);
-        }).catch(function (err) {
-            setResult(err && err.message ? err.message : String(err), "bad");
-        });
+        readClipboardText()
+            .then(function (text) {
+                try {
+                    $("paste").value = text.slice(0, 4000);
+                } catch (e) {}
+                var got;
+                try {
+                    got = ingest(text);
+                } catch (e) {
+                    throw new Error(
+                        (e && e.message ? e.message : String(e)) +
+                        " [clipboard " + text.length + " chars, starts: \"" + text.slice(0, 70).replace(/\s+/g, " ") + "\"]"
+                    );
+                }
+                loadSamples(got.samples, got.detail, got.unit, got.size);
+            })
+            .catch(function (err) {
+                setResult(err && err.message ? err.message : String(err), "bad");
+            });
     });
 
     $("btn-clip").addEventListener("click", function () {
@@ -921,7 +1198,7 @@
         setResult("Reading clip (max 80 keys)…", "muted");
         readClipTracking(ppro)
             .then(function (got) {
-                loadSamples(got.samples, got.detail);
+                loadSamples(got.samples, got.detail, got.unit, got.size);
             })
             .catch(function (err) {
                 setResult(err && err.message ? err.message : String(err), "bad");
@@ -931,16 +1208,22 @@
             });
     });
 
-    $("paste").addEventListener("change", function () {
+    var pasteTimer = null;
+    function ingestPasteBox() {
         try {
-            var v = $("paste").value;
-            if (asText(v).trim()) {
-                var got = ingest(v);
-                loadSamples(got.samples, got.detail, got.unit, got.size);
-            }
+            var v = asText($("paste").value).trim();
+            if (v.length < 30) return;
+            var got = ingest(v);
+            loadSamples(got.samples, got.detail, got.unit, got.size);
         } catch (err) {
             setResult(err.message || String(err), "bad");
         }
+    }
+    ["paste", "input", "change"].forEach(function (evt) {
+        $("paste").addEventListener(evt, function () {
+            clearTimeout(pasteTimer);
+            pasteTimer = setTimeout(ingestPasteBox, 200);
+        });
     });
 
     function setMode(mode) {
